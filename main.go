@@ -3,13 +3,21 @@ package main
 import (
 	"context"
 	"fmt"
+	"image"
 	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
+
+	"github.com/disintegration/imaging"
 )
 
-type Result struct{}
+type Result struct {
+	srcImagePath   string
+	thumbnailImage image.Image
+	err            error
+}
 
 func getContentType(path string) (string, error) {
 
@@ -36,6 +44,7 @@ func walkPath(ctx context.Context, root string) (<-chan string, <-chan error) {
 	errorCh := make(chan error, 1)
 
 	go func() {
+		defer close(pathCh)
 		errorCh <- filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return err
@@ -69,6 +78,43 @@ func walkPath(ctx context.Context, root string) (<-chan string, <-chan error) {
 
 func processImage(ctx context.Context, pathCh <-chan string) <-chan Result {
 	results := make(chan Result)
+
+	thumbnail := func() {
+		for path := range pathCh {
+			srcImage, err := imaging.Open(path)
+			if err != nil {
+				select {
+				case results <- Result{srcImagePath: path, thumbnailImage: nil, err: err}:
+				case <-ctx.Done():
+				}
+			}
+
+			image := imaging.Thumbnail(srcImage, 100, 100, imaging.Lanczos)
+
+			select {
+			case results <- Result{srcImagePath: path, thumbnailImage: image, err: nil}:
+			case <-ctx.Done():
+			}
+		}
+	}
+
+	//fan out
+	var wg sync.WaitGroup
+	maxPool := 5
+	wg.Add(maxPool)
+
+	for i := 0; i < maxPool; i++ {
+		go func() {
+			thumbnail()
+			wg.Done()
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
 	return results
 }
 
