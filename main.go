@@ -1,21 +1,22 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"image"
 	"io/fs"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/disintegration/imaging"
 )
 
 type Result struct {
 	srcImagePath   string
-	thumbnailImage image.Image
+	thumbnailImage *image.NRGBA
 	err            error
 }
 
@@ -39,7 +40,7 @@ func getContentType(path string) (string, error) {
 	return http.DetectContentType(buffer), nil
 }
 
-func walkPath(ctx context.Context, root string) (<-chan string, <-chan error) {
+func walkPath(done <-chan struct{}, root string) (<-chan string, <-chan error) {
 	pathCh := make(chan string)
 	errorCh := make(chan error, 1)
 
@@ -51,7 +52,7 @@ func walkPath(ctx context.Context, root string) (<-chan string, <-chan error) {
 			}
 
 			if !d.Type().IsRegular() {
-				return fmt.Errorf("%v is not a file", d)
+				return nil
 			}
 
 			contextType, err := getContentType(path)
@@ -66,7 +67,9 @@ func walkPath(ctx context.Context, root string) (<-chan string, <-chan error) {
 
 			select {
 			case pathCh <- path:
-			case <-ctx.Done():
+				fmt.Println("sending path", path)
+			case <-done:
+				return fmt.Errorf("walk canceled")
 			}
 
 			return nil
@@ -76,16 +79,19 @@ func walkPath(ctx context.Context, root string) (<-chan string, <-chan error) {
 	return pathCh, errorCh
 }
 
-func processImage(ctx context.Context, pathCh <-chan string) <-chan Result {
+func processImage(done <-chan struct{}, pathCh <-chan string) <-chan Result {
 	results := make(chan Result)
+	var wg sync.WaitGroup
 
 	thumbnail := func() {
 		for path := range pathCh {
+			fmt.Println("process", path)
 			srcImage, err := imaging.Open(path)
 			if err != nil {
 				select {
 				case results <- Result{srcImagePath: path, thumbnailImage: nil, err: err}:
-				case <-ctx.Done():
+				case <-done:
+					return
 				}
 			}
 
@@ -93,14 +99,14 @@ func processImage(ctx context.Context, pathCh <-chan string) <-chan Result {
 
 			select {
 			case results <- Result{srcImagePath: path, thumbnailImage: image, err: nil}:
-			case <-ctx.Done():
+			case <-done:
+				return
 			}
 		}
 	}
 
 	//fan out
-	var wg sync.WaitGroup
-	maxPool := 5
+	const maxPool = 5
 	wg.Add(maxPool)
 
 	for i := 0; i < maxPool; i++ {
@@ -138,13 +144,16 @@ func saveImage(results <-chan Result) error {
 }
 
 func SetUpPipeline(root string) error {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	done := make(chan struct{})
 
-	pathCh, errorCh := walkPath(ctx, root)
+	pathCh, errorCh := walkPath(done, root)
 
-	results := processImage(ctx, pathCh)
-	saveImage(results)
+	results := processImage(done, pathCh)
+	saveErr := saveImage(results)
+
+	if saveErr != nil {
+		return saveErr
+	}
 
 	if err := <-errorCh; err != nil {
 		return err
@@ -154,4 +163,17 @@ func SetUpPipeline(root string) error {
 
 }
 
-func main() {}
+func main() {
+	if len(os.Args) < 2 {
+		log.Fatal("image directory path not informed")
+	}
+	start := time.Now()
+	root := os.Args[1]
+	err := SetUpPipeline(root)
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Printf("Time taken %s\n", time.Since(start))
+}
