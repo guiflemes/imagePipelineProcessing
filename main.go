@@ -118,7 +118,24 @@ func processImage(ctx context.Context, pathCh <-chan string) <-chan Result {
 	return results
 }
 
-func saveImage(results <-chan Result) {}
+func saveImage(results <-chan Result) error {
+	for result := range results {
+		if result.err != nil {
+			return result.err
+		}
+
+		filename := filepath.Base(result.srcImagePath)
+		dest := "thumbnail/" + filename
+
+		if err := imaging.Save(result.thumbnailImage, dest); err != nil {
+			return err
+		}
+
+		fmt.Println(result.srcImagePath, "->", dest)
+	}
+
+	return nil
+}
 
 func SetUpPipeline(root string) error {
 	ctx, cancel := context.WithCancel(context.Background())
